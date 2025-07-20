@@ -1,0 +1,1460 @@
+#!/usr/bin/env python3
+"""
+ROCOREN WiFi Security Learning Game - Complete Edition
+=====================================================
+
+An interactive educational game that teaches WiFi security concepts through
+hands-on challenges using your ROCOREN USB adapter.
+
+Author: ROCOREN Game Development Team
+License: GPL v3
+WARNING: For educational and authorized testing ONLY!
+"""
+
+import os
+import sys
+import time
+import json
+import random
+import threading
+import subprocess
+import signal
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+import argparse
+from datetime import datetime, timedelta
+import logging
+
+# Try to import required packages
+try:
+    import scapy.all as scapy
+    from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11ProbeReq, Dot11Auth, Dot11Deauth
+    from scapy.layers.eap import EAPOL
+    import colorama
+    from colorama import Fore, Back, Style
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    from rich.live import Live
+    from rich.layout import Layout
+    from rich.text import Text
+    import pygame
+except ImportError as e:
+    print(f"Missing dependency: {e}")
+    print("Install with: pip install scapy colorama rich pygame")
+    sys.exit(1)
+
+# Initialize colorama and rich
+colorama.init()
+console = Console()
+
+# Game Configuration
+GAME_VERSION = "2.0.0"
+GAME_TITLE = "ROCOREN WiFi Security Learning Game"
+
+class GameState(Enum):
+    MENU = "menu"
+    TUTORIAL = "tutorial"
+    PLAYING = "playing"
+    PAUSED = "paused"
+    GAME_OVER = "game_over"
+    VICTORY = "victory"
+    LEADERBOARD = "leaderboard"
+
+class Difficulty(Enum):
+    BEGINNER = "beginner"
+    INTERMEDIATE = "intermediate"
+    ADVANCED = "advanced"
+    EXPERT = "expert"
+
+class Challenge(Enum):
+    NETWORK_DISCOVERY = "network_discovery"
+    SIGNAL_ANALYSIS = "signal_analysis"
+    PROTOCOL_ANALYSIS = "protocol_analysis"
+    ENCRYPTION_ASSESSMENT = "encryption_assessment"
+    DEAUTH_DETECTION = "deauth_detection"
+    HANDSHAKE_CAPTURE = "handshake_capture"
+    BEACON_ANALYSIS = "beacon_analysis"
+    HIDDEN_NETWORKS = "hidden_networks"
+    CHANNEL_HOPPING = "channel_hopping"
+    BLUETOOTH_DISCOVERY = "bluetooth_discovery"
+
+@dataclass
+class Network:
+    ssid: str
+    bssid: str
+    channel: int
+    signal_strength: int
+    encryption: str
+    vendor: str
+    hidden: bool = False
+    clients: int = 0
+    beacon_interval: int = 100
+    capabilities: str = ""
+    country_code: str = "US"
+    points: int = 10
+
+@dataclass
+class Player:
+    name: str
+    score: int = 0
+    level: int = 1
+    xp: int = 0
+    challenges_completed: int = 0
+    networks_found: int = 0
+    handshakes_captured: int = 0
+    time_played: int = 0
+    achievements: List[str] = None
+    high_scores: List[int] = None
+    
+    def __post_init__(self):
+        if self.achievements is None:
+            self.achievements = []
+        if self.high_scores is None:
+            self.high_scores = []
+
+@dataclass
+class GameStats:
+    packets_captured: int = 0
+    beacons_analyzed: int = 0
+    probe_requests_seen: int = 0
+    deauth_attacks_detected: int = 0
+    handshakes_captured: int = 0
+    vulnerabilities_found: int = 0
+    scan_time: int = 0
+    
+class WiFiSecurityGame:
+    def __init__(self, interface: str = "wlp2s0", debug: bool = False):
+        self.interface = interface
+        self.debug = debug
+        self.state = GameState.MENU
+        self.difficulty = Difficulty.BEGINNER
+        self.player = Player("NetSec_Student")
+        self.current_challenge = None
+        self.networks = {}
+        self.bluetooth_devices = {}
+        self.captured_packets = []
+        self.running = True
+        self.monitor_mode = False
+        self.scanning = False
+        self.packet_capture_thread = None
+        self.stats = GameStats()
+        
+        # Game configuration
+        self.config = {
+            'target_score': 1000,
+            'time_limit': 300,
+            'difficulty': 'beginner',
+            'sound_enabled': True,
+            'auto_save': True,
+            'tutorial_completed': False
+        }
+        
+        # Setup logging
+        self.setup_logging()
+        
+        # Initialize game components
+        self.init_game_data()
+        self.init_audio()
+        self.load_player_data()
+        
+        # Handle cleanup on exit
+        signal.signal(signal.SIGINT, self.cleanup_handler)
+        signal.signal(signal.SIGTERM, self.cleanup_handler)
+    
+    def setup_logging(self):
+        """Setup logging for the game"""
+        log_dir = os.path.expanduser("~/rocoren_game_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        log_file = os.path.join(log_dir, f"game_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        
+        logging.basicConfig(
+            level=logging.DEBUG if self.debug else logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler() if self.debug else logging.NullHandler()
+            ]
+        )
+        
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Game started - Interface: {self.interface}")
+    
+    def init_game_data(self):
+        """Initialize game scenarios and challenges"""
+        self.achievements = {
+            'first_network': {'name': 'First Discovery', 'desc': 'Found your first network', 'points': 50},
+            'network_hunter': {'name': 'Network Hunter', 'desc': 'Found 10 networks', 'points': 100},
+            'hidden_finder': {'name': 'Hidden Finder', 'desc': 'Found a hidden network', 'points': 150},
+            'security_expert': {'name': 'Security Expert', 'desc': 'Identified all encryption types', 'points': 200},
+            'packet_master': {'name': 'Packet Master', 'desc': 'Captured 1000 packets', 'points': 100},
+            'deauth_detector': {'name': 'Attack Detector', 'desc': 'Detected deauth attack', 'points': 300},
+            'handshake_hunter': {'name': 'Handshake Hunter', 'desc': 'Captured WPA handshake', 'points': 500},
+            'speed_scanner': {'name': 'Speed Scanner', 'desc': 'Found 5 networks in 30 seconds', 'points': 200}
+        }
+        
+        self.game_scenarios = {
+            Challenge.NETWORK_DISCOVERY: {
+                'title': '📡 Network Discovery Challenge',
+                'description': 'Scan and identify all WiFi networks in range',
+                'objectives': ['Find at least 5 different networks', 'Identify network encryption types'],
+                'target_count': 5,
+                'time_limit': 180,
+                'points_per_network': 50,
+                'difficulty': Difficulty.BEGINNER
+            },
+            Challenge.SIGNAL_ANALYSIS: {
+                'title': '📊 Signal Strength Analysis',
+                'description': 'Analyze signal strength patterns and RF environment',
+                'objectives': ['Measure signal strength of networks', 'Identify strongest signal sources'],
+                'target_strength': -60,
+                'time_limit': 120,
+                'points_per_measurement': 25,
+                'difficulty': Difficulty.BEGINNER
+            },
+            Challenge.PROTOCOL_ANALYSIS: {
+                'title': '🔬 Protocol Deep Dive',
+                'description': 'Analyze 802.11 frame types and protocol behavior',
+                'objectives': ['Capture different frame types', 'Analyze beacon intervals'],
+                'target_frames': ['beacon', 'probe_req', 'probe_resp', 'auth'],
+                'time_limit': 240,
+                'points_per_frame': 75,
+                'difficulty': Difficulty.INTERMEDIATE
+            },
+            Challenge.ENCRYPTION_ASSESSMENT: {
+                'title': '🔒 Security Assessment',
+                'description': 'Evaluate and categorize network security configurations',
+                'objectives': ['Identify encryption types', 'Find security vulnerabilities'],
+                'security_types': ['Open', 'WEP', 'WPA', 'WPA2', 'WPA3'],
+                'time_limit': 300,
+                'points_per_assessment': 100,
+                'difficulty': Difficulty.INTERMEDIATE
+            },
+            Challenge.HIDDEN_NETWORKS: {
+                'title': '🕵️ Hidden Network Hunter',
+                'description': 'Discover networks with hidden SSIDs',
+                'objectives': ['Find networks with empty SSID', 'Identify hidden network patterns'],
+                'target_count': 2,
+                'time_limit': 300,
+                'points_per_hidden': 200,
+                'difficulty': Difficulty.ADVANCED
+            },
+            Challenge.DEAUTH_DETECTION: {
+                'title': '⚠️ Attack Detection',
+                'description': 'Monitor for deauthentication attacks (simulation)',
+                'objectives': ['Detect unusual deauth frames', 'Identify attack patterns'],
+                'time_limit': 180,
+                'points_per_detection': 300,
+                'difficulty': Difficulty.ADVANCED
+            },
+            Challenge.HANDSHAKE_CAPTURE: {
+                'title': '🤝 Handshake Analysis',
+                'description': 'Capture and analyze WPA handshakes (educational)',
+                'objectives': ['Monitor EAPOL frames', 'Understand handshake process'],
+                'time_limit': 600,
+                'points_per_handshake': 500,
+                'difficulty': Difficulty.EXPERT
+            },
+            Challenge.BLUETOOTH_DISCOVERY: {
+                'title': '🔵 Bluetooth Environment Scan',
+                'description': 'Discover and analyze Bluetooth devices',
+                'objectives': ['Find Bluetooth devices', 'Identify device types'],
+                'target_count': 3,
+                'time_limit': 150,
+                'points_per_device': 40,
+                'difficulty': Difficulty.BEGINNER
+            }
+        }
+        
+        # Create demo networks for offline practice
+        self.create_demo_networks()
+    
+    def create_demo_networks(self):
+        """Create realistic demo networks for practice"""
+        demo_networks = [
+            Network("HomeWiFi_Demo", "aa:bb:cc:dd:ee:01", 6, -45, "WPA2", "Netgear", False, 3, 100, "ESS Privacy", "US", 50),
+            Network("CoffeeShop_Guest", "bb:cc:dd:ee:ff:02", 11, -60, "Open", "Linksys", False, 8, 100, "ESS", "US", 30),
+            Network("", "cc:dd:ee:ff:aa:03", 1, -70, "WPA2", "ASUS", True, 1, 100, "ESS Privacy", "US", 150),  # Hidden
+            Network("Secure_Corp_5G", "dd:ee:ff:aa:bb:04", 36, -55, "WPA3", "Cisco", False, 12, 100, "ESS Privacy", "US", 80),
+            Network("IoT_Network", "ee:ff:aa:bb:cc:05", 11, -75, "WEP", "D-Link", False, 5, 100, "ESS Privacy", "US", 20),
+            Network("Neighbor_2.4G", "ff:aa:bb:cc:dd:06", 3, -65, "WPA2", "TP-Link", False, 2, 100, "ESS Privacy", "US", 40),
+            Network("Public_Hotspot", "aa:bb:cc:dd:ee:07", 6, -50, "Open", "Ubiquiti", False, 15, 100, "ESS", "US", 25),
+            Network("Legacy_Network", "bb:cc:dd:ee:ff:08", 11, -80, "WEP", "Belkin", False, 1, 100, "ESS Privacy", "US", 15),
+        ]
+        
+        for network in demo_networks:
+            self.networks[network.bssid] = network
+            
+        self.logger.info(f"Created {len(demo_networks)} demo networks")
+    
+    def init_audio(self):
+        """Initialize audio system for sound effects"""
+        try:
+            pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+            self.sounds = {
+                'network_found': self.create_tone(440, 0.2),
+                'challenge_complete': self.create_tone(880, 0.5),
+                'achievement': self.create_tone(660, 0.8),
+                'level_up': self.create_tone(770, 1.0),
+                'error': self.create_tone(220, 0.3),
+                'scan_beep': self.create_tone(800, 0.1),
+                'victory': self.create_melody([(523, 0.2), (659, 0.2), (784, 0.4)])
+            }
+            self.logger.info("Audio system initialized")
+        except Exception as e:
+            self.config['sound_enabled'] = False
+            self.logger.warning(f"Audio disabled: {e}")
+    
+    def create_tone(self, frequency: int, duration: float):
+        """Create a simple tone for sound effects"""
+        try:
+            sample_rate = 22050
+            frames = int(duration * sample_rate)
+            arr = []
+            for i in range(frames):
+                wave = 2048 * (i % (sample_rate // frequency) < (sample_rate // frequency) // 2) - 1024
+                arr.append([wave, wave])
+            return pygame.sndarray.make_sound(arr)
+        except:
+            return None
+    
+    def create_melody(self, notes):
+        """Create a melody from a list of (frequency, duration) tuples"""
+        try:
+            sample_rate = 22050
+            total_frames = sum(int(duration * sample_rate) for freq, duration in notes)
+            arr = []
+            
+            for freq, duration in notes:
+                frames = int(duration * sample_rate)
+                for i in range(frames):
+                    wave = 2048 * (i % (sample_rate // freq) < (sample_rate // freq) // 2) - 1024
+                    arr.append([wave, wave])
+            
+            return pygame.sndarray.make_sound(arr)
+        except:
+            return None
+    
+    def play_sound(self, sound_name: str):
+        """Play a sound effect"""
+        if self.config['sound_enabled'] and sound_name in self.sounds and self.sounds[sound_name]:
+            try:
+                self.sounds[sound_name].play()
+            except:
+                pass
+    
+    def load_player_data(self):
+        """Load player data from file"""
+        save_file = os.path.expanduser("~/rocoren_game_save.json")
+        try:
+            if os.path.exists(save_file):
+                with open(save_file, 'r') as f:
+                    data = json.load(f)
+                    self.player = Player(**data.get('player', {}))
+                    self.config.update(data.get('config', {}))
+                self.logger.info(f"Loaded player data: {self.player.name}")
+        except Exception as e:
+            self.logger.warning(f"Could not load save file: {e}")
+    
+    def save_player_data(self):
+        """Save player data to file"""
+        if not self.config['auto_save']:
+            return
+            
+        save_file = os.path.expanduser("~/rocoren_game_save.json")
+        try:
+            data = {
+                'player': asdict(self.player),
+                'config': self.config,
+                'saved_at': datetime.now().isoformat()
+            }
+            with open(save_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.logger.info("Player data saved")
+        except Exception as e:
+            self.logger.error(f"Could not save player data: {e}")
+    
+    def check_interface(self):
+        """Check if the wireless interface exists and is ready"""
+        try:
+            # Check if interface exists
+            result = subprocess.run(['ip', 'link', 'show', self.interface], 
+                                  capture_output=True, text=True)
+            if result.returncode != 0:
+                return False, f"Interface {self.interface} not found"
+            
+            # Check if it's wireless
+            wireless_path = f"/sys/class/net/{self.interface}/wireless"
+            if not os.path.exists(wireless_path):
+                return False, f"Interface {self.interface} is not wireless"
+            
+            return True, "Interface ready"
+            
+        except Exception as e:
+            return False, f"Error checking interface: {e}"
+    
+    def enable_monitor_mode(self):
+        """Enable monitor mode on the wireless interface"""
+        try:
+            self.logger.info(f"Enabling monitor mode on {self.interface}")
+            
+            # Bring interface down
+            subprocess.run(['sudo', 'ip', 'link', 'set', self.interface, 'down'], 
+                          check=True, capture_output=True)
+            
+            # Set monitor mode
+            subprocess.run(['sudo', '/sbin/iw', 'dev', self.interface, 'set', 'type', 'monitor'], 
+                          check=True, capture_output=True)
+            
+            # Bring interface up
+            subprocess.run(['sudo', 'ip', 'link', 'set', self.interface, 'up'], 
+                          check=True, capture_output=True)
+            
+            self.monitor_mode = True
+            self.logger.info("Monitor mode enabled")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to enable monitor mode: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error enabling monitor mode: {e}")
+            return False
+    
+    def disable_monitor_mode(self):
+        """Disable monitor mode and return to managed mode"""
+        try:
+            self.logger.info(f"Disabling monitor mode on {self.interface}")
+            
+            # Stop any scanning first
+            self.scanning = False
+            if self.packet_capture_thread and self.packet_capture_thread.is_alive():
+                self.packet_capture_thread.join(timeout=2)
+            
+            subprocess.run(['sudo', 'ip', 'link', 'set', self.interface, 'down'], 
+                          check=True, capture_output=True)
+            subprocess.run(['sudo', '/sbin/iw', 'dev', self.interface, 'set', 'type', 'managed'], 
+                          check=True, capture_output=True)
+            subprocess.run(['sudo', 'ip', 'link', 'set', self.interface, 'up'], 
+f self.packet_capture_thread and self.packet_capture_thread.is
+                                                                 ^^
+SyntaxError: invalid syntax
+                          check=True, capture_output=True)
+            
+            self.monitor_mode = False
+            self.logger.info("Monitor mode disabled")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to disable monitor mode: {e}")
+            return False
+    
+    def packet_handler(self, packet):
+        """Handle captured packets for analysis"""
+        if not self.scanning:
+            return
+        
+        self.stats.packets_captured += 1
+        self.captured_packets.append({
+            'timestamp': time.time(),
+            'packet': packet
+        })
+        
+        # Keep only recent packets to manage memory
+        if len(self.captured_packets) > 1000:
+            self.captured_packets = self.captured_packets[-500:]
+        
+        try:
+            if packet.haslayer(Dot11):
+                self.analyze_wifi_packet(packet)
+        except Exception as e:
+            self.logger.debug(f"Error analyzing packet: {e}")
+    
+    def analyze_wifi_packet(self, packet):
+        """Analyze WiFi packets for game purposes"""
+        try:
+            if packet.haslayer(Dot11Beacon):
+                self.handle_beacon(packet)
+                self.stats.beacons_analyzed += 1
+            elif packet.haslayer(Dot11ProbeReq):
+                self.handle_probe_request(packet)
+                self.stats.probe_requests_seen += 1
+            elif packet.haslayer(Dot11Deauth):
+                self.handle_deauth(packet)
+                self.stats.deauth_attacks_detected += 1
+            elif packet.haslayer(EAPOL):
+                self.handle_eapol(packet)
+                
+        except Exception as e:
+            self.logger.debug(f"Error analyzing WiFi packet: {e}")
+    
+    def handle_beacon(self, packet):
+        """Handle beacon frames for network discovery"""
+        try:
+            bssid = packet[Dot11].addr3
+            if bssid in self.networks:
+                return  # Already known
+                
+            # Extract network information
+            ssid = packet.info.decode('utf-8', errors='ignore') if packet.info else ""
+            
+            # Get channel from radio tap header or estimate
+            channel = 1
+            if hasattr(packet, 'Channel'):
+                channel = packet.Channel
+            
+            # Get signal strength
+            signal_strength = -70
+            if hasattr(packet, 'dBm_AntSignal'):
+                signal_strength = packet.dBm_AntSignal
+            elif hasattr(packet, 'RadioTap'):
+                signal_strength = getattr(packet.RadioTap, 'dBm_AntSignal', -70)
+            
+            # Detect encryption
+            encryption = self.detect_encryption(packet)
+            
+            # Estimate vendor from BSSID OUI
+            vendor = self.get_vendor_from_mac(bssid)
+            
+            # Check if hidden
+            hidden = len(ssid) == 0
+            
+            # Create network object
+            network = Network(
+                ssid=ssid or f"Hidden_{bssid[-5:]}",
+                bssid=bssid,
+                channel=channel,
+                signal_strength=signal_strength,
+                encryption=encryption,
+                vendor=vendor,
+                hidden=hidden,
+                points=100 if hidden else 50
+            )
+            
+            self.networks[bssid] = network
+            self.player.networks_found += 1
+            
+            # Award points
+            points = network.points
+            if hidden:
+                points *= 2
+                self.check_achievement('hidden_finder')
+            
+            self.player.score += points
+            self.play_sound('network_found')
+            
+            # Check achievements
+            if self.player.networks_found == 1:
+                self.check_achievement('first_network')
+            elif self.player.networks_found >= 10:
+                self.check_achievement('network_hunter')
+            
+            self.logger.info(f"Network discovered: {ssid or '[Hidden]'} ({bssid}) +{points} points")
+            
+        except Exception as e:
+            self.logger.debug(f"Error handling beacon: {e}")
+    
+    def handle_probe_request(self, packet):
+        """Handle probe request frames"""
+        try:
+            client_mac = packet[Dot11].addr2
+            if packet.info:
+                target_ssid = packet.info.decode('utf-8', errors='ignore')
+                self.logger.debug(f"Probe request: {client_mac} looking for {target_ssid}")
+        except Exception as e:
+            self.logger.debug(f"Error handling probe request: {e}")
+    
+    def handle_deauth(self, packet):
+        """Handle deauthentication frames (for attack detection)"""
+        try:
+            victim = packet[Dot11].addr1
+            attacker = packet[Dot11].addr2
+            self.logger.info(f"Deauth detected: {attacker} -> {victim}")
+            
+            # Award points for detecting attacks
+            self.player.score += 300
+            self.play_sound('achievement')
+            self.check_achievement('deauth_detector')
+            
+        except Exception as e:
+            self.logger.debug(f"Error handling deauth: {e}")
+    
+    def handle_eapol(self, packet):
+        """Handle EAPOL frames (handshake detection)"""
+        try:
+            self.logger.info("EAPOL frame detected (handshake activity)")
+            self.stats.handshakes_captured += 1
+            self.player.handshakes_captured += 1
+            self.player.score += 500
+            self.play_sound('achievement')
+            self.check_achievement('handshake_hunter')
+            
+        except Exception as e:
+            self.logger.debug(f"Error handling EAPOL: {e}")
+    
+    def detect_encryption(self, packet):
+        """Detect encryption type from beacon frame"""
+        try:
+            cap = packet[Dot11Beacon].cap
+            
+            # Check privacy bit
+            if not (cap & 0x10):
+                return "Open"
+            
+            # Look for RSN (WPA2/WPA3) information element
+            if packet.haslayer(scapy.Dot11EltRSN):
+                rsn_info = packet[scapy.Dot11EltRSN].info
+                if b'\x00\x0f\xac\x0c' in rsn_info:  # AES-GCMP-256 (WPA3)
+                    return "WPA3"
+                else:
+                    return "WPA2"
+            
+            # Look for vendor-specific WPA information element
+            vendor_elements = packet.getlayer(scapy.Dot11EltVendorSpecific)
+            if vendor_elements:
+                return "WPA"
+            
+            # Default to WEP if privacy bit is set but no WPA/WPA2 found
+            return "WEP"
+            
+        except:
+            return "Unknown"
+    
+    def get_vendor_from_mac(self, mac_address):
+        """Get vendor from MAC address OUI (simplified)"""
+        oui_map = {
+            '00:50:56': 'VMware',
+            '08:00:27': 'VirtualBox',
+            '00:0c:29': 'VMware',
+            '00:16:3e': 'Xen',
+            '00:1b:21': 'Intel',
+            '00:22:48': 'TP-Link',
+            '00:26:f2': 'Netgear',
+            '00:18:39': 'Cisco',
+            '00:24:01': 'D-Link',
+            '30:85:a9': 'ASUS',
+            '94:10:3e': 'Linksys'
+        }
+        
+        oui = mac_address[:8].upper()
+        return oui_map.get(oui, 'Unknown')
+    
+    def check_achievement(self, achievement_id):
+        """Check and award achievements"""
+        if achievement_id in self.player.achievements:
+            return
+        
+        if achievement_id in self.achievements:
+            achievement = self.achievements[achievement_id]
+            self.player.achievements.append(achievement_id)
+            self.player.score += achievement['points']
+            self.play_sound('achievement')
+            
+            console.print(f"\n🏆 Achievement Unlocked: {achievement['name']}", style="bold gold")
+            console.print(f"   {achievement['desc']} (+{achievement['points']} points)", style="gold")
+            
+            self.logger.info(f"Achievement unlocked: {achievement['name']}")
+    
+    def start_packet_capture(self):
+        """Start packet capture in a separate thread"""
+        if not self.monitor_mode:
+            return False
+        
+        self.scanning = True
+        self.packet_capture_thread = threading.Thread(target=self._capture_packets)
+        self.packet_capture_thread.daemon = True
+        self.packet_capture_thread.start()
+        return True
+    
+    def _capture_packets(self):
+        """Internal packet capture method"""
+        try:
+            scapy.sniff(
+                iface=self.interface,
+                prn=self.packet_handler,
+                stop_filter=lambda x: not self.scanning,
+                store=0
+            )
+        except Exception as e:
+            self.logger.error(f"Packet capture error: {e}")
+            self.scanning = False
+    
+    def stop_packet_capture(self):
+        """Stop packet capture"""
+        self.scanning = False
+        if self.packet_capture_thread and self.packet_capture_thread.is_alive():
+            self.packet_capture_thread.join(timeout=3)
+    
+    def display_banner(self):
+        """Display game banner"""
+        banner = f"""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║    🛡️  {GAME_TITLE:<48} 🛡️    ║
+║                      Version {GAME_VERSION:<10}                     ║
+║                                                              ║
+║         Learn WiFi Security Through Interactive Play        ║
+║              ⚠️  Educational Use Only ⚠️                   ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+        """
+        console.print(banner, style="cyan bold")
+    
+    def display_main_menu(self):
+        """Display the main menu"""
+        console.clear()
+        self.display_banner()
+        
+        # Player info panel
+        player_info = Panel(
+            f"Player: {self.player.name}\n"
+            f"Level: {self.player.level} | XP: {self.player.xp}\n"
+            f"Score: {self.player.score:,} | Networks Found: {self.player.networks_found}\n"
+            f"Achievements: {len(self.player.achievements)}/{len(self.achievements)}",
+            title="Player Stats",
+            style="green"
+        )
+        console.print(player_info)
+        console.print()
+        
+        # Main menu options
+        menu_table = Table(show_header=False, box=None, padding=(0, 2))
+        menu_table.add_column("Option", style="cyan bold", width=5)
+        menu_table.add_column("Description", style="white")
+        menu_table.add_column("Status", style="yellow")
+        
+        # Check interface status
+        interface_ok, interface_msg = self.check_interface()
+        interface_status = "✅ Ready" if interface_ok else "❌ Issue"
+        
+        menu_table.add_row("1", "🎮 Start New Challenge", interface_status)
+        menu_table.add_row("2", "📚 Tutorial & Training", "Available")
+        menu_table.add_row("3", "📊 View Statistics", f"{self.stats.packets_captured} packets")
+        menu_table.add_row("4", "🏆 Achievements", f"{len(self.player.achievements)}/{len(self.achievements)}")
+        menu_table.add_row("5", "⚙️  Settings", f"Difficulty: {self.difficulty.value}")
+        menu_table.add_row("6", "💾 Save/Load Game", "Auto-save: On" if self.config['auto_save'] else "Auto-save: Off")
+        menu_table.add_row("7", "📋 Leaderboard", "View High Scores")
+        menu_table.add_row("8", "ℹ️  About & Help", "Game Info")
+        menu_table.add_row("9", "🚪 Exit Game", "")
+        
+        console.print(menu_table)
+        
+        if not interface_ok:
+            console.print(f"\n⚠️  Interface Issue: {interface_msg}", style="red bold")
+            console.print("   Fix this before starting challenges!", style="red")
+    
+    def display_challenge_menu(self):
+        """Display challenge selection menu"""
+        console.clear()
+        console.print("🎯 Select Your Challenge", style="bold cyan")
+        console.print(f"Current Difficulty: {self.difficulty.value.title()}", style="yellow")
+        console.print()
+        
+        challenge_table = Table(show_header=True)
+        challenge_table.add_column("ID", style="cyan", width=5)
+        challenge_table.add_column("Challenge", style="yellow", width=35)
+        challenge_table.add_column("Difficulty", style="green", width=12)
+        challenge_table.add_column("Points", style="magenta", width=8)
+        challenge_table.add_column("Status", style="white", width=15)
+        
+        challenges = list(Challenge)
+        for i, challenge in enumerate(challenges, 1):
+            scenario = self.game_scenarios[challenge]
+            difficulty_stars = "⭐" * (list(Difficulty).index(scenario['difficulty']) + 1)
+            
+            # Calculate potential points
+            if 'points_per_network' in scenario:
+                max_points = scenario['points_per_network'] * scenario.get('target_count', 5)
+            elif 'points_per_frame' in scenario:
+                max_points = scenario['points_per_frame'] * len(scenario.get('target_frames', []))
+            else:
+                max_points = scenario.get('points_per_assessment', 100) * 3
+            
+            # Check if completed
+            # This is a simplified completion check - in a real game you'd track this properly
+            status = "New" if i > self.player.level else "Available"
+            
+            challenge_table.add_row(
+                str(i),
+                scenario['title'],
+                difficulty_stars,
+                f"{max_points}",
+                status
+            )
+        
+        console.print(challenge_table)
+        console.print("\n0. 🔙 Back to Main Menu")
+        console.print("d. 🎚️  Change Difficulty")
+    
+    def display_tutorial(self):
+        """Display interactive tutorial"""
+        console.clear()
+        console.print("📚 WiFi Security Game Tutorial", style="bold cyan")
+        
+        tutorial_sections = [
+            {
+                'title': '🎮 How to Play',
+                'content': [
+                    "1. Select a challenge from the main menu",
+                    "2. Enable monitor mode when prompted", 
+                    "3. Complete objectives within the time limit",
+                    "4. Earn points and unlock achievements",
+                    "5. Level up and unlock harder challenges"
+                ]
+            },
+            {
+                'title': '📡 Network Discovery',
+                'content': [
+                    "• Your adapter will scan for WiFi networks",
+                    "• Each network found earns points",
+                    "• Hidden networks are worth more points",
+                    "• Different encryption types have different values"
+                ]
+            },
+            {
+                'title': '🔒 Security Analysis',
+                'content': [
+                    "• Open networks (no encryption) = 20 points",
+                    "• WEP networks (weak encryption) = 30 points", 
+                    "• WPA networks (good encryption) = 50 points",
+                    "• WPA2 networks (strong encryption) = 60 points",
+                    "• WPA3 networks (latest encryption) = 100 points"
+                ]
+            },
+            {
+                'title': '🏆 Achievements',
+                'content': [
+                    "• Complete objectives to unlock achievements",
+                    "• Each achievement gives bonus points",
+                    "• Some achievements unlock new challenges",
+                    "• Track your progress in the statistics menu"
+                ]
+            },
+            {
+                'title': '⚠️  Important Safety',
+                'content': [
+                    "• Only scan networks you own or have permission to test",
+                    "• This tool is for educational purposes only",
+                    "• Monitor mode is passive - no data is transmitted",
+                    "• Always comply with local laws and regulations"
+                ]
+            }
+        ]
+        
+        for section in tutorial_sections:
+            panel = Panel(
+                "\n".join(section['content']),
+                title=section['title'],
+                style="blue"
+            )
+            console.print(panel)
+            console.print()
+        
+        console.print("Press ENTER to continue...")
+        input()
+        
+        # Mark tutorial as completed
+        self.config['tutorial_completed'] = True
+        self.save_player_data()
+    
+    def display_statistics(self):
+        """Display detailed game statistics"""
+        console.clear()
+        console.print("📊 Game Statistics", style="bold cyan")
+        console.print()
+        
+        # Player stats
+        player_stats = Table(title="Player Statistics", show_header=True)
+        player_stats.add_column("Metric", style="cyan")
+        player_stats.add_column("Value", style="green")
+        
+        player_stats.add_row("Total Score", f"{self.player.score:,}")
+        player_stats.add_row("Current Level", str(self.player.level))
+        player_stats.add_row("Experience Points", f"{self.player.xp:,}")
+        player_stats.add_row("Networks Found", str(self.player.networks_found))
+        player_stats.add_row("Challenges Completed", str(self.player.challenges_completed))
+        player_stats.add_row("Handshakes Captured", str(self.player.handshakes_captured))
+        player_stats.add_row("Time Played", f"{self.player.time_played // 60}m {self.player.time_played % 60}s")
+        
+        console.print(player_stats)
+        console.print()
+        
+        # Session stats
+        session_stats = Table(title="Current Session", show_header=True)
+        session_stats.add_column("Metric", style="cyan")
+        session_stats.add_column("Value", style="yellow")
+        
+        session_stats.add_row("Packets Captured", str(self.stats.packets_captured))
+        session_stats.add_row("Beacons Analyzed", str(self.stats.beacons_analyzed))
+        session_stats.add_row("Probe Requests", str(self.stats.probe_requests_seen))
+        session_stats.add_row("Deauth Detected", str(self.stats.deauth_attacks_detected))
+        session_stats.add_row("Handshakes Found", str(self.stats.handshakes_captured))
+        
+        console.print(session_stats)
+        console.print()
+        
+        # Network breakdown
+        if self.networks:
+            network_stats = Table(title="Networks Discovered", show_header=True)
+            network_stats.add_column("SSID", style="cyan", max_width=20)
+            network_stats.add_column("Encryption", style="green", width=10)
+            network_stats.add_column("Signal", style="yellow", width=8)
+            network_stats.add_column("Channel", style="magenta", width=8)
+            
+            for network in sorted(self.networks.values(), key=lambda x: x.signal_strength, reverse=True)[:10]:
+                signal_bar = "█" * max(1, (100 + network.signal_strength) // 10)
+                network_stats.add_row(
+                    network.ssid[:18] + "..." if len(network.ssid) > 18 else network.ssid,
+                    network.encryption,
+                    f"{network.signal_strength} dBm",
+                    str(network.channel)
+                )
+            
+            console.print(network_stats)
+        
+        console.print("\nPress ENTER to continue...")
+        input()
+    
+    def display_achievements(self):
+        """Display achievements and progress"""
+        console.clear()
+        console.print("🏆 Achievements", style="bold yellow")
+        console.print()
+        
+        achievements_table = Table(show_header=True)
+        achievements_table.add_column("Achievement", style="cyan", width=20)
+        achievements_table.add_column("Description", style="white", width=35)
+        achievements_table.add_column("Points", style="magenta", width=10)
+        achievements_table.add_column("Status", style="green", width=10)
+        
+        for achievement_id, achievement in self.achievements.items():
+            status = "✅ Earned" if achievement_id in self.player.achievements else "🔒 Locked"
+            style = "green" if achievement_id in self.player.achievements else "dim"
+            
+            achievements_table.add_row(
+                achievement['name'],
+                achievement['desc'],
+                str(achievement['points']),
+                status,
+                style=style
+            )
+        
+        console.print(achievements_table)
+        
+        completion_rate = len(self.player.achievements) / len(self.achievements) * 100
+        console.print(f"\nCompletion: {completion_rate:.1f}% ({len(self.player.achievements)}/{len(self.achievements)})")
+        
+        console.print("\nPress ENTER to continue...")
+        input()
+    
+    def start_challenge(self, challenge: Challenge):
+        """Start a specific challenge"""
+        self.current_challenge = challenge
+        self.state = GameState.PLAYING
+        scenario = self.game_scenarios[challenge]
+        
+        console.clear()
+        console.print(f"🚀 Starting: {scenario['title']}", style="bold green")
+        console.print(f"📝 Description: {scenario['description']}")
+        console.print("📋 Objectives:")
+        for objective in scenario['objectives']:
+            console.print(f"   • {objective}")
+        console.print(f"⏱️  Time Limit: {scenario['time_limit']} seconds")
+        console.print(f"🎯 Difficulty: {scenario['difficulty'].value.title()}")
+        
+        # Check if monitor mode is needed
+        if challenge in [Challenge.NETWORK_DISCOVERY, Challenge.PROTOCOL_ANALYSIS, 
+                        Challenge.DEAUTH_DETECTION, Challenge.HANDSHAKE_CAPTURE]:
+            console.print("\n⚠️  This challenge requires monitor mode", style="yellow")
+            if not self.monitor_mode:
+                enable = console.input("Enable monitor mode? (y/n): ").lower().strip()
+                if enable == 'y':
+                    console.print("Enabling monitor mode...", style="yellow")
+                    if not self.enable_monitor_mode():
+                        console.print("❌ Failed to enable monitor mode", style="red")
+                        console.print("Press ENTER to return to menu...")
+                        input()
+                        return
+                else:
+                    console.print("Challenge cancelled", style="red")
+                    return
+        
+        console.print("\nPress ENTER to begin...")
+        input()
+        
+        # Start the challenge
+        start_time = time.time()
+        
+        # Execute the specific challenge
+        if challenge == Challenge.NETWORK_DISCOVERY:
+            result = self.network_discovery_challenge(scenario, start_time)
+        elif challenge == Challenge.SIGNAL_ANALYSIS:
+            result = self.signal_analysis_challenge(scenario, start_time)
+        elif challenge == Challenge.PROTOCOL_ANALYSIS:
+            result = self.protocol_analysis_challenge(scenario, start_time)
+        elif challenge == Challenge.ENCRYPTION_ASSESSMENT:
+            result = self.encryption_assessment_challenge(scenario, start_time)
+        elif challenge == Challenge.HIDDEN_NETWORKS:
+            result = self.hidden_networks_challenge(scenario, start_time)
+        elif challenge == Challenge.BLUETOOTH_DISCOVERY:
+            result = self.bluetooth_discovery_challenge(scenario, start_time)
+        else:
+            result = self.generic_challenge(scenario, start_time)
+        
+        # Update player stats
+        self.player.challenges_completed += 1
+        self.player.time_played += int(time.time() - start_time)
+        
+        # Display results
+        self.display_challenge_results(result, scenario)
+        
+        # Save progress
+        self.save_player_data()
+    
+    def network_discovery_challenge(self, scenario, start_time):
+        """Network discovery challenge implementation"""
+        target_count = scenario['target_count']
+        time_limit = scenario['time_limit']
+        found_networks = []
+        
+        # Start packet capture if in monitor mode
+        if self.monitor_mode:
+            self.start_packet_capture()
+        
+        console.clear()
+        console.print("🔍 Network Discovery Challenge", style="bold cyan")
+        console.print(f"Find {target_count} networks within {time_limit} seconds")
+        console.print()
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console,
+        ) as progress:
+            
+            scan_task = progress.add_task("Scanning networks...", total=time_limit)
+            
+            while time.time() - start_time < time_limit:
+                elapsed = time.time() - start_time
+                remaining = time_limit - elapsed
+                
+                # Update progress
+                progress.update(scan_task, completed=elapsed)
+                
+                # Check for new networks
+                current_networks = list(self.networks.values())
+                new_networks = [n for n in current_networks if n not in found_networks]
+                
+                for network in new_networks:
+                    found_networks.append(network)
+                    points = scenario['points_per_network']
+                    if network.hidden:
+                        points *= 2
+                    
+                    self.player.score += points
+                    self.play_sound('network_found')
+                    
+                    progress.console.print(
+                        f"✅ Found: {network.ssid or '[Hidden]'} ({network.encryption}) | +{points} points", 
+                        style="green"
+                    )
+                
+                # Update task description
+                progress.update(
+                    scan_task, 
+                    description=f"Found: {len(found_networks)}/{target_count} | {remaining:.1f}s remaining"
+                )
+                
+                # Check for early completion
+                if len(found_networks) >= target_count:
+                    break
+                
+                time.sleep(1)
+        
+        # Stop packet capture
+        if self.monitor_mode:
+            self.stop_packet_capture()
+        
+        return {
+            'found': len(found_networks),
+            'target': target_count,
+            'networks': found_networks,
+            'time_taken': time.time() - start_time
+        }
+    
+    def bluetooth_discovery_challenge(self, scenario, start_time):
+        """Bluetooth device discovery challenge"""
+        target_count = scenario['target_count']
+        time_limit = scenario['time_limit']
+        discovered_devices = []
+        
+        # Demo Bluetooth devices for educational purposes
+        demo_bt_devices = [
+            {'name': 'iPhone_Demo', 'address': '12:34:56:78:90:01', 'type': 'phone', 'rssi': -45},
+            {'name': 'AirPods_Pro', 'address': '12:34:56:78:90:02', 'type': 'audio', 'rssi': -60},
+            {'name': 'Smart_Watch', 'address': '12:34:56:78:90:03', 'type': 'wearable', 'rssi': -55},
+            {'name': 'Wireless_Mouse', 'address': '12:34:56:78:90:04', 'type': 'peripheral', 'rssi': -70},
+            {'name': 'Smart_Speaker', 'address': '12:34:56:78:90:05', 'type': 'audio', 'rssi': -50},
+            {'name': 'Fitness_Tracker', 'address': '12:34:56:78:90:06', 'type': 'wearable', 'rssi': -65},
+        ]
+        
+        console.clear()
+        console.print("🔵 Bluetooth Discovery Challenge", style="bold blue")
+        console.print(f"Discover {target_count} Bluetooth devices within {time_limit} seconds")
+        console.print()
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            
+            scan_task = progress.add_task("Scanning for Bluetooth devices...", total=None)
+            
+            while time.time() - start_time < time_limit and len(discovered_devices) < target_count:
+                elapsed = time.time() - start_time
+                remaining = time_limit - elapsed
+                
+                # Simulate device discovery
+                time.sleep(3)
+                
+                if demo_bt_devices and random.random() > 0.4:
+                    device = demo_bt_devices.pop(0)
+                    discovered_devices.append(device)
+                    
+                    points = scenario['points_per_device']
+                    self.player.score += points
+                    self.play_sound('network_found')
+                    
+                    progress.console.print(
+                        f"🔵 Found: {device['name']} ({device['type']}) RSSI: {device['rssi']} dBm | +{points} points", 
+                        style="blue"
+                    )
+                
+                # Update progress
+                progress.update(
+                    scan_task,
+                    description=f"Discovered: {len(discovered_devices)}/{target_count} | {remaining:.1f}s remaining"
+                )
+                
+                if remaining <= 0:
+                    break
+        
+        return {
+            'found': len(discovered_devices),
+            'target': target_count,
+            'devices': discovered_devices,
+            'time_taken': time.time() - start_time
+        }
+    
+    def generic_challenge(self, scenario, start_time):
+        """Generic challenge implementation for other challenge types"""
+        time_limit = scenario['time_limit']
+        
+        console.clear()
+        console.print(f"🎯 {scenario['title']}", style="bold cyan")
+        console.print(f"📝 {scenario['description']}")
+        console.print(f"⏱️  Time limit: {time_limit} seconds")
+        console.print()
+        
+        # Simulate challenge progress
+        console.print("Challenge in progress...", style="yellow")
+        
+        # Simple progress simulation
+        for i in range(time_limit // 10):
+            if time.time() - start_time >= time_limit:
+                break
+            time.sleep(2)
+            console.print(f"Progress: {((i+1) * 10)}/{time_limit} seconds", style="cyan")
+        
+        # Award some points for participation
+        points = 100
+        self.player.score += points
+        
+        return {
+            'completed': True,
+            'points_earned': points,
+            'time_taken': time.time() - start_time
+        }
+    
+    def display_challenge_results(self, result, scenario):
+        """Display challenge completion results"""
+        console.clear()
+        
+        # Calculate success metrics
+        if 'found' in result and 'target' in result:
+            success_rate = result['found'] / result['target'] if result['target'] > 0 else 0
+            result_text = f"{result['found']}/{result['target']} found"
+        else:
+            success_rate = 1.0 if result.get('completed', False) else 0.5
+            result_text = "Challenge completed" if result.get('completed', False) else "Challenge attempted"
+        
+        # Determine result quality
+        if success_rate >= 0.9:
+            result_style = "green bold"
+            status = "🏆 EXCELLENT!"
+            bonus_points = 200
+            self.play_sound('victory')
+        elif success_rate >= 0.7:
+            result_style = "yellow bold"
+            status = "👍 GOOD JOB!"
+            bonus_points = 100
+            self.play_sound('challenge_complete')
+        elif success_rate >= 0.5:
+            result_style = "orange bold"
+            status = "👌 NOT BAD!"
+            bonus_points = 50
+        else:
+            result_style = "red bold"
+            status = "💪 KEEP TRYING!"
+            bonus_points = 25
+        
+        # Update player stats
+        if bonus_points > 0:
+            self.player.score += bonus_points
+            
+        # Check for level up
+        xp_gained = int(success_rate * 100)
+        self.player.xp += xp_gained
+        
+        old_level = self.player.level
+        self.player.level = min(20, 1 + self.player.xp // 500)  # Level up every 500 XP
+        
+        if self.player.level > old_level:
+            console.print("🎉 LEVEL UP!", style="magenta bold")
+            self.play_sound('level_up')
+        
+        # Display results panel
+        result_panel = Panel(
+            f"""
+{status}
+
+📊 Results: {result_text}
+🎯 Success Rate: {success_rate:.1%}
+⏱️  Time Taken: {result.get('time_taken', 0):.1f} seconds
+🏅 Bonus Points: +{bonus_points}
+⭐ XP Gained: +{xp_gained}
+📈 Total Score: {self.player.score:,}
+🎖️  Current Level: {self.player.level}
+            """.strip(),
+            title=f"Challenge Complete: {scenario['title']}",
+            style=result_style
+        )
+        
+        console.print(result_panel)
+        
+        # Check for achievements based on performance
+        if success_rate >= 0.9:
+            # Award performance-based achievements
+            pass
+        
+        # Check packet-based achievements
+        if self.stats.packets_captured >= 1000:
+            self.check_achievement('packet_master')
+        
+        console.print("\nPress ENTER to continue...")
+        input()
+    
+    def run_game(self):
+        """Main game loop"""
+        console.clear()
+        self.display_banner()
+        
+        # Show disclaimer
+        console.print(Panel(
+            "⚠️  IMPORTANT DISCLAIMER ⚠️\n\n"
+            "This educational tool is designed for learning WiFi security concepts.\n"
+            "• Only use on networks you own or have explicit permission to test\n"
+            "• Unauthorized network scanning may be illegal in your jurisdiction\n"
+            "• This tool performs passive monitoring only\n"
+            "• Always comply with local laws and regulations\n\n"
+            "By continuing, you agree to use this tool responsibly and ethically.",
+            title="Educational Use Only",
+            style="red bold"
+        ))
+        
+        consent = console.input("\nDo you agree to use this tool responsibly? (yes/no): ").lower().strip()
+        if consent != 'yes':
+            console.print("Exiting game. Stay safe and ethical! 👋", style="yellow")
+            return
+        
+        # Show tutorial for new players
+        if not self.config.get('tutorial_completed', False):
+            console.print("\n🎓 Welcome! Let's start with a quick tutorial.", style="cyan")
+            time.sleep(2)
+            self.display_tutorial()
+        
+        # Main game loop
+        while self.running:
+            try:
+                if self.state == GameState.MENU:
+                    self.display_main_menu()
+                    choice = console.input("\nSelect option (1-9): ").strip()
+                    
+                    if choice == '1':
+                        self.display_challenge_menu()
+                        challenge_choice = console.input("\nSelect challenge (1-10, 0=back, d=difficulty): ").strip()
+                        
+                        if challenge_choice == '0':
+                            continue
+                        elif challenge_choice.lower() == 'd':
+                            self.change_difficulty()
+                        elif challenge_choice.isdigit() and 1 <= int(challenge_choice) <= len(Challenge):
+                            challenge = list(Challenge)[int(challenge_choice) - 1]
+                            self.start_challenge(challenge)
+                    
+                    elif choice == '2':
+                        self.display_tutorial()
+                    elif choice == '3':
+                        self.display_statistics()
+                    elif choice == '4':
+                        self.display_achievements()
+                    elif choice == '5':
+                        self.settings_menu()
+                    elif choice == '6':
+                        self.save_load_menu()
+                    elif choice == '7':
+                        self.display_leaderboard()
+                    elif choice == '8':
+                        self.display_help()
+                    elif choice == '9':
+                        self.running = False
+                    else:
+                        console.print("Invalid choice. Please try again.", style="red")
+                        time.sleep(1)
+                
+            except KeyboardInterrupt:
+                console.print("\n\n👋 Thanks for playing! See you next time!", style="cyan")
+                break
+            except Exception as e:
+                self.logger.error(f"Game error: {e}")
+                console.print(f"An error occurred: {e}", style="red")
+                time.sleep(2)
+        
+        # Cleanup and save
+        self.cleanup()
+    
+    def change_difficulty(self):
+        """Change game difficulty"""
+        console.clear()
+        console.print("🎚️  Difficulty Settings", style="bold cyan")
+        console.print()
+        
+        difficulties = list(Difficulty)
+        for i, diff in enumerate(difficulties, 1):
+            current = " (Current)" if diff == self.difficulty else ""
+            console.print(f"{i}. {diff.value.title()}{current}")
+        
+        choice = console.input(f"\nSelect difficulty (1-{len(difficulties)}): ").strip()
+        
+        if choice.isdigit() and 1 <= int(choice) <= len(difficulties):
+            self.difficulty = difficulties[int(choice) - 1]
+            console.print(f"Difficulty set to: {self.difficulty.value.title()}", style="green")
+        else:
+            console.print("Invalid choice.", style="red")
+        
+        time.sleep(1)
+    
+    def settings_menu(self):
+        """Display and handle settings menu"""
+        console.clear()
+        console.print("⚙️  Game Settings", style="bold cyan")
+        console.print()
+        
+        console.print(f"1. Sound Effects: {'On' if self.config['sound_enabled'] else 'Off'}")
+        console.print(f"2. Auto-save: {'On' if self.config['auto_save'] else 'Off'}")
+        console.print(f"3. Interface: {self.interface}")
+        console.print(f"4. Debug Mode: {'On' if self.debug else 'Off'}")
+        console.print("5. Reset Tutorial")
+        console.print("6. Clear Game Data")
+        console.print("0. Back")
+        
+        choice = console.input("\nSelect option: ").strip()
+        
+        if choice == '1':
+            self.config['sound_enabled'] = not self.config['sound_enabled']
+            console.print(f"Sound effects: {'On' if self.config['sound_enabled'] else 'Off'}", style="green")
+        elif choice == '2':
+            self.config['auto_save'] = not self.config['auto_save']
+            console.print(f"Auto-save: {'On' if self.config['auto_save'] else 'Off'}", style="green")
+        elif choice == '3':
+            new_interface = console.input(f"Enter interface name (current: {self.interface}): ").strip()
+            if new_interface:
+                self.interface = new_interface
+                console.print(f"Interface set to: {self.interface}", style="green")
+        elif choice == '5':
+            self.config['tutorial_completed'] = False
+            console.print("Tutorial reset. It will show on next game start.", style="green")
+        elif choice == '6':
+            confirm = console.input("Are you sure you want to clear all game data? (yes/no): ").strip().lower()
+            if confirm == 'yes':
+                self.player = Player("NetSec_Student")
+                console.print("Game data cleared.", style="green")
+        
+        if choice in ['1', '2', '3', '5', '6']:
+            self.save_player_data()
+            time.sleep(1)
+    
+    def display_help(self):
+        """Display help information"""
+        console.clear()
+        help_panel = Panel(
+            f"""
+{GAME_TITLE} v{GAME_VERSION}
+
+🎮 GAME CONTROLS:
+• Use number keys to navigate menus
+• Follow on-screen prompts during challenges
+• Press Ctrl+C to safely exit at any time
+
+🔧 TECHNICAL REQUIREMENTS:
+• Linux system with Python 3.6+
+• ROCOREN USB WiFi adapter (RTL8811CU chipset)
+• Root/sudo access for monitor mode
+• Required packages: scapy, rich, colorama, pygame
+
+📚 EDUCATIONAL PURPOSE:
+This game teaches WiFi security concepts through hands-on experience.
+All activities are passive monitoring for educational purposes only.
+
+🆘 TROUBLESHOOTING:
+• If interface not found: Check USB connection and driver
+• If monitor mode fails: Ensure proper permissions
+• If no networks found: Check antenna and location
+• For crashes: Check logs in ~/rocoren_game_logs/
+
+📧 SUPPORT:
+• Documentation: See README.md
+• Issues: Check game logs for error details
+• Educational resources: Included in tutorial
+
+⚖️  LEGAL NOTICE:
+Only use on networks you own or have explicit permission to test.
+Unauthorized network scanning may violate local laws.
+            """.strip(),
+            title="Help & Information",
+            style="blue"
+        )
+        
+        console.print(help_panel)
+        console.print("\nPress ENTER to continue...")
+        input()
+    
+    def cleanup_handler(self, signum, frame):
+        """Handle cleanup on signal"""
+        console.print("\n\n🛑 Received exit signal. Cleaning up...", style="yellow")
+        self.cleanup()
+        sys.exit(0)
+    
+    def cleanup(self):
+        """Clean up resources and restore system state"""
+        self.logger.info("Starting cleanup...")
+        
+        # Stop any active scanning
+        self.scanning = False
+        if self.packet_capture_thread and self.packet_capture_thread.is_alive():
